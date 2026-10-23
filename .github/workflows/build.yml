@@ -1,0 +1,163 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: examoffice-x64-windows
+            installer: msi
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: examoffice-x64-linux
+            installer: deb
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: examoffice-x64-macos
+            installer: dmg
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: examoffice-arm64-macos
+            installer: dmg
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libsqlite3-dev \
+            pkg-config \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        working-directory: ./examoffice
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: ./examoffice
+        run: npm run build
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.event.inputs.version || github.ref_name }}
+          releaseName: 'Examoffice ${{ github.event.inputs.version || github.ref_name }}'
+          releaseBody: |
+            ## Examoffice ${{ github.event.inputs.version || github.ref_name }}
+            
+            Free, open-source typing tutor & exam platform for government typing tests (CPCT, SSC, High Court, etc.)
+            
+            ### Features
+            - **Typing Practice**: Real-time WPM, accuracy, error heatmap
+            - **Exam Mode**: Timed tests, no backspace, minimum WPM/accuracy requirements
+            - **Multi-language**: English, Hindi (InScript), extensible for Indian languages
+            - **Letter Formatting**: Hindi/English formatting exercises with font/size/alignment rules
+            - **Paper Management**: Create, import, export custom exam papers
+            - **Virtual Keyboard**: On-screen QWERTY/InScript keyboard with visual feedback
+            - **Privacy First**: No tracking, no cloud, all data local
+            - **Cross-platform**: Windows, Linux, macOS
+            
+            ### Installation
+            - **Windows**: Run the `.msi` installer
+            - **Linux**: Install the `.deb` package (`sudo dpkg -i examoffice_*.deb`)
+            - **macOS**: Open the `.dmg` and drag to Applications
+            
+            ### What's New
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+          releaseDraft: false
+          prerelease: false
+          args: --target ${{ matrix.target }}
+          includeUpdater: true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            examoffice/target/${{ matrix.target }}/release/bundle/**/*
+          retention-days: 7
+
+  # Optional: Create a combined release with all platforms
+  release:
+    name: Create Combined Release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: examoffice-*
+          merge-multiple: false
+
+      - name: Create checksums
+        run: |
+          cd artifacts
+          for dir in examoffice-*; do
+            if [ -d "$dir" ]; then
+              find "$dir" -type f \( -name "*.msi" -o -name "*.deb" -o -name "*.dmg" -o -name "*.AppImage" \) -exec sha256sum {} \; > "${dir}_SHA256SUMS.txt"
+            fi
+          done
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: artifacts/*_SHA256SUMS.txt
